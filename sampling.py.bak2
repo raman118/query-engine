@@ -1,0 +1,1019 @@
+"""Sampling strategies for approximate query processing with error bounds.
+
+This module provides a comprehensive set of sampling techniques for data analysis
+and approximate query processing. Each sampling method comes with statistical
+error bounds and confidence intervals, supporting both parametric and non-parametric
+approaches.
+
+Classes
+-------
+ErrorBounds: Container for statistical bounds including point estimates and intervals
+SamplingConfig: Configuration parameters for sampling operations
+AbstractSampler: Base class defining the sampling interface
+SimpleRandomSampler: Simple random sampling with vectorized operations
+StratifiedSampler: Stratified sampling with optimal allocation
+ReservoirSampler: Streaming-friendly reservoir sampling
+
+Features
+--------
+* Multiple error estimation methods:
+  - Normal distribution (for large samples)
+  - Student's t-distribution (for small samples)
+  - Bootstrap resampling (non-parametric, robust)
+  - Order statistics (distribution-free)
+
+* Performance optimizations:
+  - Vectorized operations
+  - Batch processing for large datasets
+  - Memory-efficient implementations
+  - Configurable batch sizes
+
+* Error bound calculations:
+  - Confidence intervals
+  - Margin of error
+  - Relative error
+  - Finite population correction
+  - Bootstrap intervals
+
+Examples
+--------
+>>> from sampling import SimpleRandomSampler, SamplingConfig
+>>> config = SamplingConfig(
+...     confidence_level=0.95,
+...     error_method='bootstrap',
+...     n_bootstrap=1000
+... )
+>>> sampler = SimpleRandomSampler(config)
+>>> sample = sampler.sample(data, size=1000)
+>>> bounds = sampler.estimate_error_bounds(sample, 'value')
+"""
+
+__all__ = [
+    'ErrorBounds',
+    'SamplingConfig',
+    'DistributionType',
+    'AbstractSampler',
+    'SimpleRandomSampler',
+    'StratifiedSampler',
+    'ReservoirSampler',
+    'DEFAULT_CONFIDENCE',
+    'DEFAULT_BOOTSTRAP_ITERATIONS',
+    'DEFAULT_BATCH_SIZE'
+]
+
+# Class descriptions:
+# ErrorBounds: Container for statistical bounds including point estimates and intervals
+# SamplingConfig: Configuration parameters for sampling operations
+# AbstractSampler: Base class defining the sampling interface
+# SimpleRandomSampler: Simple random sampling with vectorized operations
+# StratifiedSampler: Stratified sampling with optimal allocation
+ReservoirSampler
+"""
+
+from typing import (
+    List, Optional, Union, Any, Dict, Tuple, Callable, Protocol,
+    runtime_checkable, Literal, TypeVar, overload, cast, Final
+)
+from typing import (
+    List, Optional, Union, Any, Dict, Tuple, Callable, Protocol,
+    runtime_checkable, Literal, TypeVar, overload, cast, Final
+)
+from numpy.typing import NDArray, ArrayLike
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass, field
+from collections import defaultdict
+import scipy.stats as stats
+from abc import ABC, abstractmethod
+from numpy.random import RandomState, Generator
+from pandas.core.frame import DataFrame
+from pandas.core.series import Series
+from enum import Enum, auto
+
+# Type aliases for improved readability
+Number = Union[int, float]
+SampleData = Union[DataFrame, Series]
+EstimatorFunction = Callable[[NDArray[Any]], float]
+
+# Constants
+DEFAULT_CONFIDENCE: Final[float] = 0.95
+DEFAULT_BOOTSTRAP_ITERATIONS: Final[int] = 1000
+DEFAULT_BATCH_SIZE: Final[int] = 100_000
+
+class DistributionType(Enum):
+    """Supported distribution types for error bounds."""
+    NORMAL = auto()
+    STUDENT_T = auto()
+    BOOTSTRAP = auto()
+    NON_PARAMETRIC = auto()
+    
+    @classmethod
+    def from_str(cls, value: str) -> 'DistributionType':
+        """Convert string to DistributionType.
+        
+        Args:
+            value: String representation of distribution type
+            
+        Returns:
+            DistributionType enum value
+            
+        Raises:
+            ValueError: If string doesn't match any distribution type
+        """
+        try:
+            return {
+                'normal': cls.NORMAL,
+                'student_t': cls.STUDENT_T,
+                'bootstrap': cls.BOOTSTRAP,
+                'non_parametric': cls.NON_PARAMETRIC
+            }[value.lower()]
+        except KeyError:
+            raise ValueError(f"Unknown distribution type: {value}")
+
+@dataclass(frozen=True)
+class SamplingConfig:
+    """Configuration parameters for sampling operations.
+    
+    This class encapsulates all configuration parameters for sampling
+    operations and provides validation of the parameters. It ensures
+    that all parameters are within valid ranges and are consistent
+    with each other.
+    
+    Attributes:
+        confidence_level: Confidence level for error bounds (0 to 1)
+        error_method: Method for error bound calculation
+        n_bootstrap: Number of bootstrap iterations
+        batch_size: Size of batches for processing large datasets
+        random_state: Seed or random number generator for reproducibility
+        
+    Example:
+        >>> config = SamplingConfig(
+        ...     confidence_level=0.95,
+        ...     error_method='bootstrap',
+        ...     n_bootstrap=1000,
+        ...     batch_size=100000
+        ... )
+        >>> sampler = SimpleRandomSampler(config)
+    """
+    confidence_level: float = DEFAULT_CONFIDENCE
+    error_method: str = 'normal'
+    n_bootstrap: int = DEFAULT_BOOTSTRAP_ITERATIONS
+    batch_size: int = DEFAULT_BATCH_SIZE
+    random_state: Optional[Union[int, RandomState, Generator]] = None
+    
+    def __post_init__(self) -> None:
+        """Validate configuration parameters."""
+        if not 0 < self.confidence_level < 1:
+            raise ValueError("Confidence level must be between 0 and 1")
+            
+        if self.error_method not in {
+            'normal', 'student_t', 'bootstrap', 'non_parametric'
+        }:
+            raise ValueError(f"Unknown error method: {self.error_method}")
+            
+        if self.n_bootstrap < 1:
+            raise ValueError("Number of bootstrap iterations must be positive")
+            
+        if self.batch_size < 1:
+            raise ValueError("Batch size must be positive")
+            
+    @property
+    def distribution_type(self) -> DistributionType:
+        """Get the distribution type enum for the current error method."""
+        return DistributionType.from_str(self.error_method)
+
+@dataclass(frozen=True)
+class ErrorBounds:
+    """Statistical bounds for sample-based estimates.
+    
+    This class encapsulates the results of statistical estimation, including
+    point estimates and confidence intervals. Supports multiple methods of
+    error bound calculation including parametric and non-parametric approaches.
+
+    Attributes:
+        estimate (float): The point estimate (e.g., sample mean)
+        lower_bound (float): Lower bound of the confidence interval
+        upper_bound (float): Upper bound of the confidence interval
+        confidence_level (float): Confidence level (e.g., 0.95 for 95% confidence)
+        sample_size (int): Size of the sample used for estimation
+        population_size (Optional[int]): Total population size if known
+        method (str): Method used for error bound calculation
+            One of: 'normal', 'student_t', 'bootstrap', 'non_parametric'
+        distribution_type (Optional[DistributionType]): Type of distribution assumed
+        n_iterations (Optional[int]): Number of iterations for bootstrap/simulation
+
+    Example:
+        >>> bounds = ErrorBounds(
+        ...     estimate=100.0,
+        ...     lower_bound=95.0,
+        ...     upper_bound=105.0,
+        ...     confidence_level=0.95,
+        ...     sample_size=1000,
+        ...     method='bootstrap',
+        ...     n_iterations=1000
+        ... )
+        >>> print(f"Estimate: {bounds.estimate} ± {bounds.margin_of_error}")
+        Estimate: 100.0 ± 5.0
+        >>> print(f"95% CI: [{bounds.lower_bound}, {bounds.upper_bound}]")
+        95% CI: [95.0, 105.0]
+        >>> print(f"Relative Error: {bounds.relative_error:.2%}")
+        Relative Error: 5.00%
+        
+    Raises:
+        ValueError: If bounds are inconsistent or parameters are invalid
+    """
+    estimate: float
+    lower_bound: float
+    upper_bound: float
+    confidence_level: float
+    sample_size: int
+    population_size: Optional[int] = None
+    method: str = field(default='normal')
+    distribution_type: Optional[DistributionType] = None
+    n_iterations: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        """Validate the error bounds parameters."""
+        if not 0 < self.confidence_level < 1:
+            raise ValueError("Confidence level must be between 0 and 1")
+        
+        if self.sample_size < 0:
+            raise ValueError("Sample size cannot be negative")
+            
+        if self.population_size is not None and self.population_size < self.sample_size:
+            raise ValueError("Population size must be >= sample size")
+            
+        if not self.lower_bound <= self.estimate <= self.upper_bound:
+            raise ValueError("Estimate must be within bounds")
+
+    @property
+    def margin_of_error(self) -> float:
+        """Calculate the margin of error."""
+        return (self.upper_bound - self.lower_bound) / 2
+    
+    @property
+    def relative_error(self) -> float:
+        """Calculate the relative error bound."""
+        return self.margin_of_error / abs(self.estimate) if self.estimate != 0 else float('inf')
+
+@runtime_checkable
+class SamplingStrategy(Protocol):
+    """Protocol defining the interface for sampling strategies."""
+    
+    def sample(self, data: DataFrame, **kwargs) -> DataFrame: ...
+    def estimate_error_bounds(self, sample: DataFrame, column: str,
+                            population_size: Optional[int] = None) -> ErrorBounds: ...
+
+class AbstractSampler(ABC):
+    """Base class for sampling implementations.
+    
+    This class provides the common infrastructure for all sampling strategies,
+    including error estimation, validation, and configuration handling.
+    
+    Key Features:
+    - Error estimation methods:
+        - Normal distribution for large samples
+        - Student's t for small samples
+        - Bootstrap for non-normal data
+        - Non-parametric for unknown distributions
+        
+    - Sample size determination:
+        - Based on target error margins
+        - Finite population correction
+        - Confidence level adjustment
+        
+    - Performance optimizations:
+        - Vectorized operations
+        - Batch processing
+        - Memory-efficient sampling
+        
+    - Error handling:
+        - Special value handling (NaN, inf)
+        - Parameter validation
+        - Edge case protection
+        
+    Implementation Requirements:
+    Subclasses must implement:
+    - sample(): Main sampling logic
+    - estimate_error_bounds(): Error bound calculation
+    
+    Additional methods available:
+    - estimate_error(): Low-level error estimation
+    - required_sample_size(): Sample size calculation
+    - _bootstrap_estimate(): Bootstrap resampling
+    - _non_parametric_estimate(): Distribution-free bounds
+    
+    Notes:
+    - All random operations use NumPy's Generator API
+    - Thread-safe random number generation
+    - Configurable batch sizes for large datasets
+    - Consistent error bound handling across methods
+    
+    def __init__(self, config: Optional[SamplingConfig] = None):
+        """Initialize sampler with configuration parameters.
+        
+        Args:
+            config: Optional configuration parameters. If not provided,
+                default configuration will be used.
+            
+        Raises:
+            ValueError: If configuration parameters are invalid
+        """
+        if config is None:
+            config = SamplingConfig()
+            
+        self.config = config
+        self.confidence_level = config.confidence_level
+        self.error_method = config.error_method
+        self.n_bootstrap = config.n_bootstrap
+        self._rng = self._initialize_rng(config.random_state)
+        
+    def _initialize_rng(self,
+                     random_state: Optional[Union[int, RandomState, Generator]] = None
+                     ) -> Generator:
+        """Initialize the random number generator.
+        
+        Args:
+            random_state: Seed or random number generator
+            
+        Returns:
+            numpy.random.Generator instance
+        """
+        if isinstance(random_state, Generator):
+            return random_state
+        elif isinstance(random_state, RandomState):
+            # Convert legacy RandomState to Generator using its seed
+            seed = random_state.randint(0, 2**32 - 1)
+            return np.random.default_rng(seed)
+        return np.random.default_rng(random_state)
+        
+    def _bootstrap_estimate(self, values: np.ndarray, 
+                          estimator: Callable[[np.ndarray], float] = np.mean) -> Tuple[float, float]:
+        """Calculate confidence intervals using bootstrapping.
+        
+        Args:
+            values: Array of values to bootstrap
+            estimator: Function to calculate the statistic of interest
+            
+        Returns:
+            Tuple of (lower_bound, upper_bound)
+        """
+        if len(values) == 0:
+            return 0.0, 0.0
+            
+        bootstrap_estimates = []
+        rng = np.random.default_rng(seed=42)  # Use fixed seed for reproducibility
+        
+        for _ in range(self.n_bootstrap):
+            # Resample with replacement
+            resampled = rng.choice(values, size=len(values), replace=True)
+            bootstrap_estimates.append(estimator(resampled))
+            
+        # Calculate percentile confidence intervals
+        alpha = (1 - self.confidence_level) / 2
+        lower = np.percentile(bootstrap_estimates, alpha * 100)
+        upper = np.percentile(bootstrap_estimates, (1 - alpha) * 100)
+        
+        return float(lower), float(upper)
+        
+    def _non_parametric_estimate(self, values: np.ndarray) -> Tuple[float, float]:
+        """Calculate confidence intervals using non-parametric methods.
+        
+        Uses order statistics for robust estimation without distributional assumptions.
+        """
+        if len(values) == 0:
+            return 0.0, 0.0
+            
+        # Sort values and find indices for confidence intervals
+        sorted_vals = np.sort(values)
+        n = len(values)
+        alpha = (1 - self.confidence_level) / 2
+        
+        lower_idx = int(np.floor(n * alpha))
+        upper_idx = int(np.ceil(n * (1 - alpha)))
+        
+        if upper_idx >= n:
+            upper_idx = n - 1
+            
+        return float(sorted_vals[lower_idx]), float(sorted_vals[upper_idx])
+    
+    @abstractmethod
+    def sample(self, data: DataFrame, **kwargs) -> DataFrame:
+        """Take a sample from the data."""
+        pass
+    
+    @abstractmethod
+    def estimate_error_bounds(self, sample: DataFrame, column: str,
+                            population_size: Optional[int] = None) -> ErrorBounds:
+        """Calculate error bounds for the sample."""
+        pass
+    
+    def estimate_error(self, values: np.ndarray, 
+                      estimator: Callable[[np.ndarray], float] = np.mean) -> Union[float, Tuple[float, float]]:
+        """Estimate error bounds for the given values using the specified method.
+        
+        Args:
+            values: Array of values to estimate error for
+            estimator: Function to calculate the statistic of interest (default: mean)
+            
+        Returns:
+            If using normal/student_t: margin of error as float
+            If using bootstrap/non_parametric: tuple of (lower, upper) bounds
+        """
+        if len(values) < 2:
+            return 0.0 if self.error_method in ('normal', 'student_t') else (0.0, 0.0)
+            
+        if self.error_method == 'normal':
+            std_dev = np.std(values, ddof=1)
+            z_score = stats.norm.ppf((1 + self.confidence_level) / 2)
+            return z_score * (std_dev / np.sqrt(len(values)))
+            
+        elif self.error_method == 'student_t':
+            std_dev = np.std(values, ddof=1)
+            t_score = stats.t.ppf((1 + self.confidence_level) / 2, df=len(values)-1)
+            return t_score * (std_dev / np.sqrt(len(values)))
+            
+        elif self.error_method == 'bootstrap':
+            return self._bootstrap_estimate(values, estimator)
+            
+        elif self.error_method == 'non_parametric':
+            return self._non_parametric_estimate(values)
+            
+        else:
+            raise ValueError(f"Unknown error method: {self.error_method}")
+            
+    def required_sample_size(self, error_margin: float,
+                           population_size: Optional[int] = None) -> int:
+        """Calculate required sample size for target error margin."""
+        z_score = stats.norm.ppf(1 - (1 - self.confidence_level) / 2)
+        base_size = (z_score ** 2 * 0.25) / (error_margin ** 2)
+        
+        if population_size is None:
+            return int(np.ceil(base_size))
+        
+        return int(np.ceil(
+            (base_size * population_size) / (base_size + population_size - 1)
+        ))
+
+class SimpleRandomSampler(AbstractSampler):
+    """Simple random sampling with error bounds.
+
+    This class implements simple random sampling using vectorized operations
+    and batch processing for large datasets. It supports both fixed-size 
+    sampling and sampling to achieve a target error margin.
+
+    Example:
+        sampler = SimpleRandomSampler()
+        sample = sampler.sample(data, size=1000)
+        bounds = sampler.estimate_error_bounds(sample, 'value')
+    """
+
+    def __init__(self, config: Optional[SamplingConfig] = None) -> None:
+        """Initialize the sampler with optional configuration."""
+        super().__init__(config)
+
+    def sample(self, data: DataFrame, size: Optional[int] = None,
+              error_margin: Optional[float] = None, **kwargs) -> DataFrame:
+        """Take a simple random sample using vectorized operations."""
+        batch_size = self.config.batch_size
+        
+        Parameters:
+        -----------
+        data : DataFrame
+            Input DataFrame to sample from
+        size : int, optional
+            Number of samples to take
+        error_margin : float, optional
+            Target error margin (used if size is None)
+        **kwargs : dict
+            Additional sampling parameters
+            
+        Returns:
+        --------
+        DataFrame
+            DataFrame containing the sampled rows
+            
+        Raises:
+        -------
+        ValueError
+            If neither size nor error_margin is specified
+        """
+        batch_size = self.config.batch_size
+        
+        Args:
+            data: Input DataFrame to sample from
+            size: Number of samples to take
+            error_margin: Target error margin (used if size is None)
+            batch_size: Size of batches for processing large datasets
+            **kwargs: Additional arguments
+            
+        Returns:
+            DataFrame containing the sampled rows
+        """
+        sample_size: int
+        if size is None:
+            if error_margin is None:
+                raise ValueError("Either size or error_margin must be specified")
+            sample_size = self.required_sample_size(error_margin, len(data))
+        else:
+            sample_size = size
+            
+        total_rows = len(data)
+        sample_size = min(sample_size, total_rows)
+        
+        if total_rows <= batch_size:
+            # For small datasets, use pandas built-in sampling
+            return data.sample(n=sample_size)
+        
+        # For large datasets, use batched sampling
+        samples = []
+        remaining = sample_size
+        
+        # Calculate selection probabilities
+        prob_per_batch = remaining / total_rows
+        
+        # Process in batches
+        for start in range(0, total_rows, batch_size):
+            end = min(start + batch_size, total_rows)
+            batch = data.iloc[start:end]
+            
+            # Calculate batch sample size
+            batch_prob = prob_per_batch * len(batch)
+            batch_size_adj = min(int(np.ceil(batch_prob)), remaining)
+            
+            if batch_size_adj > 0:
+                batch_sample = batch.sample(n=batch_size_adj)
+                samples.append(batch_sample)
+                remaining -= len(batch_sample)
+            
+            if remaining <= 0:
+                break
+                
+        return pd.concat(samples, ignore_index=True)
+    
+    def estimate_error_bounds(self, sample: DataFrame, column: str,
+                            population_size: Optional[int] = None) -> ErrorBounds:
+        """Calculate error bounds using selected method.
+        
+        Handles special values (NaN, infinity) by filtering them out before
+        calculating statistics. Returns zero bounds if no valid values are found.
+        
+        Args:
+            sample: DataFrame containing the sample
+            column: Name of the column to analyze
+            population_size: Optional total population size for finite population correction
+            
+        Returns:
+            ErrorBounds object containing point estimate and confidence intervals
+        """
+        # Convert to numeric and filter out special values
+        values = pd.to_numeric(sample[column], errors='coerce')
+        clean_values = values[np.isfinite(values)].to_numpy()
+        
+        if len(clean_values) == 0:
+            return ErrorBounds(
+                estimate=0.0,
+                lower_bound=0.0,
+                upper_bound=0.0,
+                confidence_level=self.confidence_level,
+                sample_size=0,
+                population_size=population_size
+            )
+        
+        n = len(clean_values)
+        estimate = float(np.mean(clean_values))
+        
+        # Handle single value case
+        if n == 1:
+            return ErrorBounds(
+                estimate=estimate,
+                lower_bound=estimate,
+                upper_bound=estimate,
+                confidence_level=self.confidence_level,
+                sample_size=1,
+                population_size=population_size
+            )
+            
+        # Calculate error bounds based on selected method
+        result = self.estimate_error(clean_values)
+        
+        if isinstance(result, tuple):
+            lower, upper = result
+        else:
+            # For normal and student_t methods that return margin of error
+            margin = result
+            if population_size is not None:
+                # Apply finite population correction
+                fpc = np.sqrt((population_size - n) / (population_size - 1))
+                margin *= fpc
+            lower = estimate - margin
+            upper = estimate + margin
+        
+        return ErrorBounds(
+            estimate=estimate,
+            lower_bound=float(lower),
+            upper_bound=float(upper),
+            confidence_level=self.confidence_level,
+            sample_size=n,
+            population_size=population_size
+        )
+
+class StratifiedSampler(AbstractSampler):
+    """Stratified sampling with optimal allocation."""
+    
+    def sample(self, data: DataFrame, strata_column: str,
+              size: Optional[int] = None, error_margin: Optional[float] = None,
+              allocation: str = 'proportional', batch_size: int = 100000,
+              **kwargs) -> DataFrame:
+        """Take a stratified sample with specified allocation method using vectorized operations.
+        
+        Args:
+            data: Input DataFrame to sample from
+            strata_column: Column to use for stratification
+            size: Number of samples to take
+            error_margin: Target error margin (used if size is None)
+            allocation: Method to allocate samples across strata ('proportional', 'equal', 'neyman')
+            batch_size: Size of batches for processing large datasets
+            **kwargs: Additional arguments
+            
+        Returns:
+            DataFrame containing the stratified sample
+        """
+        # Calculate total sample size
+        sample_size: int
+        if size is None:
+            if error_margin is None:
+                raise ValueError("Either size or error_margin must be specified")
+            sample_size = self.required_sample_size(error_margin, len(data))
+        else:
+            sample_size = size
+        
+        # Get strata information
+        strata = data[strata_column].unique()
+        strata_sizes = {
+            stratum: len(data[data[strata_column] == stratum])
+            for stratum in strata
+        }
+        
+        # Calculate stratum sample sizes
+        stratum_samples: Dict[Any, int]
+        if allocation == 'proportional':
+            # Use floor instead of ceil to avoid overshooting target size
+            stratum_samples = {
+                stratum: int(np.floor(sample_size * strata_sizes[stratum] / len(data)))
+                for stratum in strata
+            }
+            # Distribute remaining samples to largest strata
+            remaining = sample_size - sum(stratum_samples.values())
+            if remaining > 0:
+                sorted_strata = sorted(strata, key=lambda s: strata_sizes[s], reverse=True)
+                for i in range(remaining):
+                    stratum_samples[sorted_strata[i]] += 1
+        elif allocation == 'equal':
+            # Ensure total matches target size
+            base_size = sample_size // len(strata)
+            stratum_samples = {stratum: base_size for stratum in strata}
+            remaining = sample_size - sum(stratum_samples.values())
+            for i in range(remaining):
+                stratum_samples[strata[i]] += 1
+        elif allocation == 'neyman':
+            # Calculate standard deviations for numeric columns only
+            numeric_cols = data.select_dtypes(include=np.number).columns
+            if len(numeric_cols) == 0:
+                # If no numeric columns, fall back to proportional allocation
+                strata_std = {stratum: 1.0 for stratum in strata}
+            else:
+                strata_std = {
+                    stratum: float(data[data[strata_column] == stratum][numeric_cols].std().mean())
+                    for stratum in strata
+                }
+            total_alloc = sum(
+                strata_sizes[s] * strata_std[s] for s in strata
+            )
+            # Use floor and distribute remaining to maintain exact size
+            stratum_samples = {
+                stratum: int(np.floor(
+                    sample_size * strata_sizes[stratum] * strata_std[stratum]
+                    / total_alloc
+                ))
+                for stratum in strata
+            }
+            remaining = sample_size - sum(stratum_samples.values())
+            # Distribute remaining to strata with highest standard deviation
+            sorted_strata = sorted(strata, key=lambda s: strata_std[s], reverse=True)
+            for i in range(remaining):
+                stratum_samples[sorted_strata[i]] += 1
+        else:
+            raise ValueError(f"Unknown allocation method: {allocation}")
+        
+        # Take samples from each stratum using vectorized operations
+        samples = []
+        total_rows = len(data)
+        
+        if total_rows <= batch_size:
+            # For small datasets, process all at once
+            for stratum, stratum_size in stratum_samples.items():
+                stratum_data = data[data[strata_column] == stratum]
+                if len(stratum_data) > 0:
+                    samples.append(stratum_data.sample(
+                        n=min(stratum_size, len(stratum_data))
+                    ))
+        else:
+            # For large datasets, process in batches
+            # First, create a mapping of row indices for each stratum
+            stratum_indices = data.groupby(strata_column).indices
+            
+            # Process each stratum in batches
+            for stratum, target_size in stratum_samples.items():
+                if stratum not in stratum_indices:
+                    continue
+                    
+                stratum_idx = stratum_indices[stratum]
+                remaining = target_size
+                stratum_samples_list = []
+                
+                # Process the stratum in batches
+                for start in range(0, len(stratum_idx), batch_size):
+                    end = min(start + batch_size, len(stratum_idx))
+                    batch_idx = stratum_idx[start:end]
+                    batch = data.iloc[batch_idx]
+                    
+                    # Calculate batch sample size
+                    batch_size_adj = min(remaining, len(batch))
+                    if batch_size_adj > 0:
+                        batch_sample = batch.sample(n=batch_size_adj)
+                        stratum_samples_list.append(batch_sample)
+                        remaining -= batch_size_adj
+                    
+                    if remaining <= 0:
+                        break
+                
+                if stratum_samples_list:
+                    samples.append(pd.concat(stratum_samples_list, ignore_index=True))
+        
+        return pd.concat(samples, ignore_index=True)
+    
+    def estimate_error_bounds(self, sample: DataFrame, column: str,
+                            population_size: Optional[int] = None) -> ErrorBounds:
+        """Calculate stratified error bounds.
+        
+        Handles special values (NaN, infinity) by filtering them out before
+        calculating statistics. Returns default bounds if no valid values are found.
+        """
+        values = pd.to_numeric(sample[column], errors='coerce')
+        clean_values = values[np.isfinite(values)]
+        
+        if len(clean_values) == 0:
+            return ErrorBounds(
+                estimate=0.0,
+                lower_bound=0.0,
+                upper_bound=0.0,
+                confidence_level=self.confidence_level,
+                sample_size=0,
+                population_size=population_size
+            )
+        
+        n = len(clean_values)
+        values_array = np.array(clean_values, dtype=np.float64)
+        
+        # For a single value, return it with zero margin
+        if n == 1:
+            mean_val = float(values_array[0])
+            return ErrorBounds(
+                estimate=mean_val,
+                lower_bound=mean_val,
+                upper_bound=mean_val,
+                confidence_level=self.confidence_level,
+                sample_size=1,
+                population_size=population_size
+            )
+        
+        mean_val = float(np.mean(values_array))
+        var_val = float(np.var(values_array, ddof=1))
+        
+        if population_size is not None:
+            fpc = float(np.sqrt((population_size - n) / (population_size - 1)))
+            var_val *= fpc
+        
+        z_score = float(stats.norm.ppf(1 - (1 - self.confidence_level) / 2))
+        margin = float(z_score * np.sqrt(var_val / n))
+        
+        return ErrorBounds(
+            estimate=mean_val,
+            lower_bound=mean_val - margin,
+            upper_bound=mean_val + margin,
+            confidence_level=self.confidence_level,
+            sample_size=n,
+            population_size=population_size
+        )
+
+class ClusterSampler(AbstractSampler):
+    """Cluster sampling implementation."""
+    
+    def sample(self, data: DataFrame, cluster_column: str,
+              size: Optional[int] = None, error_margin: Optional[float] = None,
+              **kwargs) -> DataFrame:
+        """Take a cluster sample.
+        
+        Args:
+            data: Input DataFrame to sample from
+            cluster_column: Column that identifies clusters
+            size: Number of clusters to sample
+            error_margin: Target error margin (used if size is None)
+            **kwargs: Additional arguments
+        
+        Returns:
+            DataFrame containing all rows from the sampled clusters
+        """
+        if size is None:
+            if error_margin is None:
+                raise ValueError("Either size or error_margin must be specified")
+            size = self.required_sample_size(error_margin, data[cluster_column].nunique())
+        
+        # Sample clusters
+        clusters = data[cluster_column].unique()
+        sampled_clusters = np.random.choice(
+            clusters,
+            size=min(size, len(clusters)),
+            replace=False
+        )
+        
+        # Get all rows from sampled clusters
+        return data[data[cluster_column].isin(sampled_clusters)].copy()
+    
+    def estimate_error_bounds(self, sample: DataFrame, column: str,
+                            population_size: Optional[int] = None) -> ErrorBounds:
+        """Calculate error bounds for cluster sampling."""
+        values = pd.to_numeric(sample[column], errors='coerce')
+        clean_values = values[np.isfinite(values)]
+        
+        if len(clean_values) == 0:
+            return ErrorBounds(
+                estimate=0.0,
+                lower_bound=0.0,
+                upper_bound=0.0,
+                confidence_level=self.confidence_level,
+                sample_size=0,
+                population_size=population_size
+            )
+        
+        n = len(clean_values)
+        values_array = np.array(clean_values, dtype=np.float64)
+        
+        mean_val = float(np.mean(values_array))
+        var_val = float(np.var(values_array, ddof=1))
+        
+        # Adjust for cluster sampling design effect
+        if population_size is not None:
+            deff = self._estimate_design_effect(sample, column)
+            var_val *= deff
+        
+        z_score = float(stats.norm.ppf(1 - (1 - self.confidence_level) / 2))
+        margin = float(z_score * np.sqrt(var_val / n))
+        
+        return ErrorBounds(
+            estimate=mean_val,
+            lower_bound=mean_val - margin,
+            upper_bound=mean_val + margin,
+            confidence_level=self.confidence_level,
+            sample_size=n,
+            population_size=population_size
+        )
+    
+    def _estimate_design_effect(self, sample: DataFrame, column: str) -> float:
+        """Estimate design effect for cluster sampling."""
+        # Simple estimate using intraclass correlation
+        # Could be made more sophisticated based on specific requirements
+        return 1.5  # Typical value for moderate clustering
+
+class SystematicSampler(AbstractSampler):
+    """Systematic sampling implementation."""
+    
+    def sample(self, data: DataFrame, size: Optional[int] = None,
+              error_margin: Optional[float] = None, **kwargs) -> DataFrame:
+        """Take a systematic sample.
+        
+        Args:
+            data: Input DataFrame to sample from
+            size: Number of samples to take
+            error_margin: Target error margin (used if size is None)
+            **kwargs: Additional arguments
+        
+        Returns:
+            DataFrame containing systematically selected rows
+        """
+        if size is None:
+            if error_margin is None:
+                raise ValueError("Either size or error_margin must be specified")
+            size = self.required_sample_size(error_margin, len(data))
+        
+        n = len(data)
+        size = min(size, n)
+        
+        # Calculate sampling interval
+        interval = n / size
+        
+        # Generate systematic indices
+        start = np.random.uniform(0, interval)
+        indices = np.arange(start, n, interval).astype(int)
+        indices = indices[indices < n]  # Ensure we don't exceed data length
+        
+        return data.iloc[indices].copy()
+    
+    def estimate_error_bounds(self, sample: DataFrame, column: str,
+                            population_size: Optional[int] = None) -> ErrorBounds:
+        """Calculate error bounds for systematic sampling."""
+        values = pd.to_numeric(sample[column], errors='coerce')
+        clean_values = values[np.isfinite(values)]
+        
+        if len(clean_values) == 0:
+            return ErrorBounds(
+                estimate=0.0,
+                lower_bound=0.0,
+                upper_bound=0.0,
+                confidence_level=self.confidence_level,
+                sample_size=0,
+                population_size=population_size
+            )
+        
+        n = len(clean_values)
+        values_array = np.array(clean_values, dtype=np.float64)
+        
+        mean_val = float(np.mean(values_array))
+        var_val = float(np.var(values_array, ddof=1))
+        
+        # Adjust for systematic sampling - typically more precise than SRS
+        # Use a conservative adjustment factor
+        var_val *= 0.8  # Typical improvement over simple random sampling
+        
+        if population_size is not None:
+            fpc = float(np.sqrt((population_size - n) / (population_size - 1)))
+            var_val *= fpc
+        
+        z_score = float(stats.norm.ppf(1 - (1 - self.confidence_level) / 2))
+        margin = float(z_score * np.sqrt(var_val / n))
+        
+        return ErrorBounds(
+            estimate=mean_val,
+            lower_bound=mean_val - margin,
+            upper_bound=mean_val + margin,
+            confidence_level=self.confidence_level,
+            sample_size=n,
+            population_size=population_size
+        )
+
+class ReservoirSampler(AbstractSampler):
+    """Reservoir sampling for streaming data."""
+    
+    def __init__(self, size: int, confidence_level: float = 0.95):
+        super().__init__(confidence_level)
+        self.size = size
+        self._sample: DataFrame = pd.DataFrame()
+        self.count = 0
+    
+    def add(self, data: DataFrame) -> None:
+        """Add new data to the reservoir."""
+        for _, row in data.iterrows():
+            self.count += 1
+            if len(self._sample) < self.size:
+                self._sample = pd.concat(
+                    [self._sample, pd.DataFrame([row.to_dict()])],
+                    ignore_index=True
+                )
+            else:
+                j = np.random.randint(0, self.count)
+                if j < self.size:
+                    self._sample.iloc[j] = row.to_dict()
+    
+    def get_sample(self) -> DataFrame:
+        """Get the current sample."""
+        return self._sample.copy()
+    
+    def sample(self, data: DataFrame, **kwargs) -> DataFrame:
+        """Sample from data directly."""
+        self.add(data)
+        return self.get_sample()
+    
+    def estimate_error_bounds(self, sample: DataFrame, column: str,
+                            population_size: Optional[int] = None) -> ErrorBounds:
+        """Calculate error bounds for the reservoir sample."""
+        values = sample[column]
+        n = len(values)
+        mean = values.mean()
+        std_err = values.std(ddof=1) / np.sqrt(n)
+        
+        t_value = stats.t.ppf(1 - (1 - self.confidence_level) / 2, df=n-1)
+        margin = t_value * std_err
+        
+        if population_size is not None:
+            fpc = np.sqrt((population_size - n) / (population_size - 1))
+            margin *= fpc
+        
+        return ErrorBounds(
+            estimate=mean,
+            lower_bound=mean - margin,
+            upper_bound=mean + margin,
+            confidence_level=self.confidence_level,
+            sample_size=n,
+            population_size=population_size
+        )

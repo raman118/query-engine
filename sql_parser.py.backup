@@ -1,0 +1,389 @@
+"""
+SQL Parser for Approximate Query Engine using sqlglot.
+
+This module provides a robust SQL parsing implementation that supports:
+- SELECT, WHERE, GROUP BY clauses
+- Aggregation functions (COUNT, SUM, AVG)
+- DISTINCT keyword
+- Approximate query syntax with error bounds
+"""
+
+import re
+from typing import Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass
+import sqlglot
+from sqlglot.expressions import (
+    Select, Column, Table, Func, Group, Expression,
+    Where, Binary, Identifier
+)
+
+@dataclass
+class AggregateInfo:
+    """Information about an aggregation function in a query."""
+    function: str  # e.g., 'COUNT', 'AVG'
+    column: str    # Column being aggregated
+    alias: Optional[str] = None  # Optional AS clause
+    is_distinct: bool = False
+
+@dataclass
+class QueryInfo:
+    """Parsed information about a SQL query."""
+    select_columns: List[Union[str, AggregateInfo]]
+    table: str
+    where_clause: Optional[str] = None
+    group_by: List[str] = None
+    error_bound: Optional[float] = None
+    confidence_level: Optional[float] = None
+
+    def __post_init__(self):
+        if self.group_by is None:
+            self.group_by = []
+
+class SQLParser:
+    """
+    A SQL parser that handles both exact and approximate queries.
+    
+    Supports:
+    - Basic SELECT, WHERE, GROUP BY
+    - Aggregations: COUNT, SUM, AVG
+    - DISTINCT keyword
+    - Error bound specifications
+    """
+    
+    def __init__(self):
+        """Initialize the SQL parser."""
+        self.query_types = {
+            'select': r'SELECT\s+(.+?)\s+FROM',
+            'from': r'FROM\s+(\w+)',
+            'where': r'WHERE\s+(.+?)(?:\s+GROUP\s+BY|\s+ORDER\s+BY|$)',
+            'group_by': r'GROUP\s+BY\s+(.+?)(?:\s+ORDER\s+BY|$)',
+            'error_bound': r'WITH\s+ACCURACY\s+(\d+(?:\.\d+)?)%',
+            'confidence': r'WITHIN\s+(\d+(?:\.\d+)?)%\s+CONFIDENCE'
+        }
+    
+    def parse_query(self, sql: str) -> QueryInfo:
+        """Parse SQL query into structured format."""
+        sql = sql.strip().rstrip(';')
+        
+        # Extract basic components
+        table = self._extract_table(sql)
+        select_columns = self._extract_select_columns(sql)
+        where_clause = self._extract_where(sql)
+        group_by = self._extract_group_by(sql)
+        error_bound = self._extract_error_bound(sql)
+        confidence_level = self._extract_confidence_level(sql)
+        
+        return QueryInfo(
+            select_columns=select_columns,
+            table=table,
+            where_clause=where_clause,
+            group_by=group_by,
+            error_bound=error_bound,
+            confidence_level=confidence_level
+        )
+    
+    def _extract_match(self, pattern: str, sql: str) -> Optional[str]:
+        """Extract the first match for a given pattern."""
+        match = re.search(pattern, sql, re.IGNORECASE | re.DOTALL)
+        return match.group(1).strip() if match else None
+    
+    def _extract_table(self, sql: str) -> str:
+        """Extract table name from SQL."""
+        table = self._extract_match(self.query_types['from'], sql)
+        if not table:
+            raise ValueError("Missing FROM clause in query")
+        return table.lower()
+    
+    def _extract_select_columns(self, sql: str) -> List[Union[str, AggregateInfo]]:
+        """Extract and parse SELECT columns."""
+        select_part = self._extract_match(self.query_types['select'], sql)
+        if not select_part:
+            raise ValueError("Missing SELECT clause")
+        
+        columns = []
+        for col in select_part.split(','):
+            col = col.strip()
+            
+            # Check for aggregation functions
+            agg_info = self._parse_aggregation(col)
+            if agg_info:
+                columns.append(AggregateInfo(
+                    function=agg_info['function'],
+                    column=agg_info['column'],
+                    is_distinct=agg_info.get('distinct', False)
+                ))
+            else:
+                columns.append(col.lower())
+        
+        return columns
+    
+    def _extract_where(self, sql: str) -> Optional[str]:
+        """Extract WHERE clause."""
+        return self._extract_match(self.query_types['where'], sql)
+    
+    def _extract_group_by(self, sql: str) -> List[str]:
+        """Extract GROUP BY columns."""
+        group_by = self._extract_match(self.query_types['group_by'], sql)
+        if not group_by:
+            return []
+        return [col.strip().lower() for col in group_by.split(',')]
+    
+    def _extract_error_bound(self, sql: str) -> Optional[float]:
+        """Extract error bound percentage."""
+        bound = self._extract_match(self.query_types['error_bound'], sql)
+        return float(bound) / 100 if bound else None
+    
+    def _extract_confidence_level(self, sql: str) -> Optional[float]:
+        """Extract confidence level."""
+        confidence = self._extract_match(self.query_types['confidence'], sql)
+        return float(confidence) / 100 if confidence else None
+    
+    def _parse_aggregation(self, col: str) -> Optional[Dict]:
+        """Parse aggregation functions from a column expression."""
+        # Check for COUNT DISTINCT first
+        distinct_pattern = r'COUNT\s*\(\s*DISTINCT\s+([^)]+)\)'
+        match = re.match(distinct_pattern, col, re.IGNORECASE)
+        if match:
+            return {
+                'function': 'COUNT',
+                'distinct': True,
+                'column': match.group(1).strip().lower()
+            }
+        
+        # Then check for other aggregations
+        agg_pattern = r'(COUNT|SUM|AVG|MIN|MAX)\s*\(([^)]+)\)'
+        match = re.match(agg_pattern, col, re.IGNORECASE)
+        if match:
+            function = match.group(1).upper()
+            column = match.group(2).strip()
+            
+            # Handle COUNT(*)
+            if column == '*' and function == 'COUNT':
+                return {
+                    'function': function,
+                    'distinct': False,
+                    'column': '*'
+                }
+                
+            # For other aggregations, use lowercase column names
+            return {
+                'function': function,
+                'distinct': False,
+                'column': column.lower()
+            }
+            
+        return None
+    ```sql
+    -- Exact query
+    SELECT category, AVG(price) FROM sales GROUP BY category;
+    
+    -- Approximate query with error bound
+    APPROXIMATE SELECT COUNT(DISTINCT user_id) 
+    FROM sales 
+    WHERE price > 100 
+    WITH ACCURACY 95%;
+    ```
+    """
+    
+    def __init__(self):
+        self.supported_aggs = {'COUNT', 'SUM', 'AVG'}
+        
+    def parse_query(self, sql: str) -> QueryInfo:
+        """
+        Parse a SQL query into its components.
+        
+        Args:
+            sql: The SQL query string to parse
+            
+        Returns:
+            QueryInfo object containing parsed query components
+            
+        Raises:
+            sqlglot.ParseError: If the SQL syntax is invalid
+            ValueError: If unsupported features are used
+        """
+        # Check for approximate query syntax
+        is_approximate = sql.upper().startswith('APPROXIMATE ')
+        if is_approximate:
+            sql = sql[11:].strip()  # Remove APPROXIMATE keyword
+        
+        # Extract error bounds if present
+        error_bound = None
+        confidence_level = None
+        if 'WITH ACCURACY' in sql.upper():
+            sql, error_spec = sql.split('WITH ACCURACY', 1)
+            error_spec = error_spec.strip('% ;')
+            try:
+                confidence_level = float(error_spec) / 100
+                error_bound = 1 - confidence_level
+            except ValueError:
+                raise ValueError(f"Invalid accuracy specification: {error_spec}")
+        
+        # Parse main SQL using sqlglot
+        try:
+            ast = sqlglot.parse_one(sql)
+        except Exception as e:
+            raise ValueError(f"SQL parsing error: {str(e)}")
+            
+        if not isinstance(ast, Select):
+            raise ValueError("Only SELECT queries are supported")
+            
+        # Extract table
+        if not ast.find(Table):
+            raise ValueError("No FROM clause found")
+        table = ast.find(Table).name
+        
+        # Process SELECT columns and aggregations
+        select_columns = []
+        for expr in ast.select:
+            if isinstance(expr, Func):
+                if expr.name.upper() not in self.supported_aggs:
+                    raise ValueError(f"Unsupported aggregation: {expr.name}")
+                    
+                agg = AggregateInfo(
+                    function=expr.name.upper(),
+                    column=str(expr.args[0]),
+                    alias=str(expr.alias) if expr.alias else None,
+                    is_distinct=expr.distinct
+                )
+                select_columns.append(agg)
+            else:
+                select_columns.append(str(expr))
+                
+        # Extract WHERE clause
+        where_clause = None
+        where = ast.find(Where)
+        if where:
+            where_clause = str(where.this)
+            
+        # Extract GROUP BY
+        group_by = []
+        group = ast.find(Group)
+        if group:
+            group_by = [str(col) for col in group.expressions]
+            
+        return QueryInfo(
+            select_columns=select_columns,
+            table=table,
+            where_clause=where_clause,
+            group_by=group_by,
+            error_bound=error_bound,
+            confidence_level=confidence_level
+        )
+    
+    def format_query(self, query_info: QueryInfo) -> str:
+        """
+        Convert a QueryInfo object back to a SQL string.
+        
+        Args:
+            query_info: QueryInfo object to convert
+            
+        Returns:
+            Formatted SQL query string
+        """
+        # Format SELECT clause
+        select_parts = []
+        for col in query_info.select_columns:
+            if isinstance(col, AggregateInfo):
+                distinct = "DISTINCT " if col.is_distinct else ""
+                func = f"{col.function}({distinct}{col.column})"
+                if col.alias:
+                    func += f" AS {col.alias}"
+                select_parts.append(func)
+            else:
+                select_parts.append(str(col))
+                
+        sql = f"SELECT {', '.join(select_parts)} FROM {query_info.table}"
+        
+        # Add WHERE
+        if query_info.where_clause:
+            sql += f" WHERE {query_info.where_clause}"
+            
+        # Add GROUP BY
+        if query_info.group_by:
+            sql += f" GROUP BY {', '.join(query_info.group_by)}"
+            
+        # Add error bound if approximate
+        if query_info.confidence_level is not None:
+            sql = f"APPROXIMATE {sql} WITH ACCURACY {query_info.confidence_level * 100}%"
+            
+        return f"{sql};"
+        
+    def _extract_aliases(self, original_sql: str) -> dict:
+        """Extract column aliases from the original SQL."""
+        as_clauses = {}
+        for match in re.finditer(r'(\w+)\s+as\s+(\w+)', original_sql, re.IGNORECASE):
+            as_clauses[match.group(1).upper()] = match.group(2)
+        
+        # Process each column
+        columns = []
+        for col in select_part.split(','):
+            col = col.strip()
+            # Check if this is an AS clause
+            as_match = re.match(r'(.+?)\s+AS\s+(\w+)', col)
+            if as_match:
+                expr = as_match.group(1).strip()
+                alias = as_clauses.get(expr, as_match.group(2).lower())
+                columns.append(f"{expr} AS {alias}")
+            else:
+                # Convert simple column names to lowercase
+                if not any(agg in col.upper() for agg in ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'DISTINCT']):
+                    col = col.lower()
+                columns.append(col)
+        return columns
+    
+    def _extract_group_by(self, sql: str) -> List[str]:
+        """Extract and clean columns from GROUP BY clause."""
+        group_by = self._extract_match(self.query_types['group_by'], sql)
+        if not group_by:
+            return []
+        # Convert GROUP BY columns to lowercase since they're direct column references
+        return [col.strip().lower() for col in group_by.split(',')]
+    
+    def _parse_aggregation(self, col: str) -> Optional[Dict]:
+        """Parse aggregation functions from a column expression."""
+        # Match standard aggregation functions
+        agg_pattern = r'(COUNT|SUM|AVG|MIN|MAX)\s*\(([^)]+)\)'
+        distinct_pattern = r'COUNT\s*\(\s*DISTINCT\s+([^)]+)\)'
+        
+        # Check for COUNT DISTINCT first
+        match = re.match(distinct_pattern, col, re.IGNORECASE)
+        if match:
+            return {
+                'function': 'COUNT',
+                'distinct': True,
+                'column': match.group(1).strip().lower()  # Column names should be lowercase
+            }
+        
+        # Then check for other aggregations
+        match = re.match(agg_pattern, col, re.IGNORECASE)
+        if match:
+            function = match.group(1).upper()
+            column = match.group(2).strip()
+            
+            # Handle COUNT(*)
+            if column == '*' and function == 'COUNT':
+                return {
+                    'function': function,
+                    'distinct': False,
+                    'column': '*'
+                }
+                
+            # For other aggregations, use lowercase column names
+            return {
+                'function': function,
+                'distinct': False,
+                'column': column.lower()
+            }
+            
+        return None
+    
+    def validate_query(self, query: Dict) -> bool:
+        """Validate parsed query structure."""
+        if not query.get('table'):
+            raise ValueError("Missing FROM clause")
+        
+        if not query.get('select_cols'):
+            raise ValueError("Missing SELECT columns")
+            
+        return True

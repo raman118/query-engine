@@ -1,0 +1,61 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run Approximate Query Engine Demo",
+			"type": "shell",
+			"command": "C:/Users/Raman/Desktop/hackathons/.venv/Scripts/python.exe run_demo.py",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Run Approximate Query Engine Demo",
+			"type": "shell",
+			"command": "C:/Users/Raman/Desktop/hackathons/.venv/Scripts/python.exe run_demo.py",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Backup original parser",
+			"type": "shell",
+			"command": "copy sql_parser.py sql_parser.py.backup",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Replace corrupted parser",
+			"type": "shell",
+			"command": "copy sql_parser_fixed.py sql_parser.py",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Run Demo (Fixed)",
+			"type": "shell",
+			"command": "C:/Users/Raman/Desktop/hackathons/.venv/Scripts/python.exe run_demo.py",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Run Standalone Demo",
+			"type": "shell",
+			"command": "C:/Users/Raman/Desktop/hackathons/.venv/Scripts/python.exe demo_standalone.py",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Test SQL Parser Import",
+			"type": "shell",
+			"command": "C:/Users/Raman/Desktop/hackathons/.venv/Scripts/python.exe -c \"import sql_parser; print('✅ SQL Parser imports successfully')\"",
+			"isBackground": false,
+			"group": "test"
+		},
+		{
+			"label": "Simple Python Test",
+			"type": "shell",
+			"command": "C:/Users/Raman/Desktop/hackathons/.venv/Scripts/python.exe -c \"print('Testing Python environment...')\"",
+			"isBackground": false,
+			"group": "test"
+		}
+	]
+}

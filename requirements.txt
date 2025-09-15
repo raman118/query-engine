@@ -1,5 +1,18 @@
-pandas>=1.5.0
-numpy>=1.21.0
-mmh3>=3.0.0
-matplotlib>=3.5.0
-seaborn>=0.12.0
+# Core dependencies
+pandas==2.0.3
+numpy==1.24.4
+sqlglot==11.5.0
+matplotlib==3.7.2
+seaborn==0.12.2
+tabulate==0.9.0
+rich==13.5.2
+typing-extensions==4.7.1
+mmh3==3.1.0  # For HyperLogLog hash functions
+
+# Development dependencies
+pytest==7.4.0
+pytest-cov==4.1.0
+black==23.7.0
+isort==5.12.0
+flake8==6.1.0
+mypy==1.5.1
